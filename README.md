@@ -1,4 +1,4 @@
-# Hi there, I'm Neudron 👋
+# Hi there, I'm Neudron.
 
 I'm a game developer who loves to create awesome things with code. I have experience in various technologies and frameworks such as Lua,Luau and C++. 
 
