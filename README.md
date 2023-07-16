@@ -1,16 +1,27 @@
-### Hi there 👋
+# Hi there, I'm Neudron 👋
 
-<!--
-**Neudron/Neudron** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+I'm a software engineer and web developer who loves to create awesome things with code. I have experience in various technologies and frameworks such as React, Node.js, MongoDB, Firebase, and more. I'm always eager to learn new skills and explore new challenges.
 
-Here are some ideas to get you started:
+## 🔭 I’m currently working on ...
 
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+- A portfolio website to showcase my projects and skills
+- A social media app that connects people with similar interests
+- A chatbot that helps users find the best deals online
+
+## 🌱 I’m currently learning ...
+
+- TypeScript and Next.js for building scalable and performant web applications
+- GraphQL and Apollo for creating flexible and efficient APIs
+- Tailwind CSS and Chakra UI for designing beautiful and responsive user interfaces
+
+## 📫 How to reach me ...
+
+- Email: neudron@gmail.com
+- Twitter: @neudron_dev
+- LinkedIn: https://www.linkedin.com/in/neudron-dev/
+
+## 🏆 My GitHub stats ...
+
+![Neudron's GitHub stats](https://github-readme-stats.vercel.app/api?username=neudron&show_icons=true&theme=radical)
+
+![Top Langs](https://github-readme-stats.vercel.app/api/top-langs/?username=neudron&layout=compact&theme=radical)
