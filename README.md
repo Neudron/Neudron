@@ -1,24 +1,17 @@
 # Hi there, I'm Neudron 👋
 
-I'm a software engineer and web developer who loves to create awesome things with code. I have experience in various technologies and frameworks such as React, Node.js, MongoDB, Firebase, and more. I'm always eager to learn new skills and explore new challenges.
+I'm a game developer who loves to create awesome things with code. I have experience in various technologies and frameworks such as Lua,Luau and C++. 
 
 ## 🔭 I’m currently working on ...
 
-- A portfolio website to showcase my projects and skills
-- A social media app that connects people with similar interests
-- A chatbot that helps users find the best deals online
-
-## 🌱 I’m currently learning ...
-
-- TypeScript and Next.js for building scalable and performant web applications
-- GraphQL and Apollo for creating flexible and efficient APIs
-- Tailwind CSS and Chakra UI for designing beautiful and responsive user interfaces
-
+- A Roblox Game called ChaosCombat
+- A Discord Bot
+- 
 ## 📫 How to reach me ...
 
-- Email: neudron@gmail.com
-- Twitter: @neudron_dev
-- LinkedIn: https://www.linkedin.com/in/neudron-dev/
+- Twitter: @SoyNeudron
+- Discord: uhcv / neudron
+- LinkedIn: https://www.linkedin.com/in/neudronx/
 
 ## 🏆 My GitHub stats ...
 
