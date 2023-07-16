@@ -9,9 +9,9 @@ I'm a game developer who loves to create awesome things with code. I have experi
   
 ## 📫 How to reach me ...
 
-- Twitter: @SoyNeudron
-- Discord: uhcv / neudron
-- LinkedIn: https://www.linkedin.com/in/neudronx/
+[Twitter: @SoyNeudron](https://twitter.com/SoyNeudron)
+[Discord: uhcv / neudron](https://discord.com/users/uhcv)
+[LinkedIn: Neudron](https://www.linkedin.com/in/neudronx/)
 
 ## 🏆 My GitHub stats ...
 
