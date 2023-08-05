@@ -5,7 +5,6 @@ I'm a game developer who loves to create awesome things with code. I have experi
 ## 🔭 I’m currently working on ...
 
 - A Roblox Game called ChaosCombat
-- A Discord Bot
   
 ## 📫 How to reach me ...
 
