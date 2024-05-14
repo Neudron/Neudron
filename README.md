@@ -1,5 +1,5 @@
 # Hi there, I'm Neudron
-
+<a href="https://discord.com/users/586251393082327060"><img align="left" src="https://lanyard.cnrad.dev/api/586251393082327060?borderRadius=8px&hideDiscrim=true"/></a>
 I'm a game developer who loves to create awesome things with code. I have experience in various technologies and frameworks such as Lua,Luau and C++. 
 
 ## 🔭 I’m currently working on ...
