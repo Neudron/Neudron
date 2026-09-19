@@ -1,0 +1,6 @@
+module icloud_glass.services
+
+singleton Config 1.0 Config.qml
+singleton DataStore 1.0 DataStore.qml
+singleton Actions 1.0 Actions.qml
+singleton Ipc 1.0 Ipc.qml
