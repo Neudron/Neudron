@@ -351,21 +351,26 @@ def run_khal_new(calendar: str, title: str, start_iso: str, end_iso: str | None,
         with open(cfg, "a", encoding="utf-8") as f:
             f.write("\n[default]\nprint_new = event\n")
 
-        start_dt = parse_iso_datetime(start_iso, "--start")
-        start_local = start_dt.astimezone(tz)
         args = ["khal", "--config", str(cfg), "new", "-a", calendar,
                 "--json", "uid", "--json", "start-date", "--json", "start-time",
                 "--json", "all-day"]
         if all_day:
+            # Un día de todo el día no tiene hora: usamos la fecha tal cual
+            # viene en el ISO (los 10 primeros caracteres), sin convertir de
+            # zona horaria, igual que hace el lado optimista de Actions.qml.
+            parse_iso_datetime(start_iso, "--start")  # solo para validar formato
+            start_date_str = start_iso[:10]
             args.append("--")
-            args.append(start_local.strftime("%Y-%m-%d"))
+            args.append(start_date_str)
             if end_iso:
-                end_dt = parse_iso_datetime(end_iso, "--end").astimezone(tz)
-                end_date = end_dt.strftime("%Y-%m-%d")
-                if end_date != start_local.strftime("%Y-%m-%d"):
-                    args.append(end_date)
+                parse_iso_datetime(end_iso, "--end")  # solo para validar formato
+                end_date_str = end_iso[:10]
+                if end_date_str != start_date_str:
+                    args.append(end_date_str)
             args.append(title)
         else:
+            start_dt = parse_iso_datetime(start_iso, "--start")
+            start_local = start_dt.astimezone(tz)
             args.append("--")
             args.append(start_local.strftime("%Y-%m-%d %H:%M"))
             if end_iso:
