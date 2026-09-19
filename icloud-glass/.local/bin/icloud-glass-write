@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""icloud-glass-write — camino de escritura del panel: completa/reabre
+recordatorios (VTODO) editando el .ics del vdir directamente, crea
+recordatorios nuevos igual, y crea eventos delegando en `khal new`. Solo usa
+la biblioteca estándar. Ver docs/CONTRACTS.md §9.
+
+Por qué no usamos `todo done <uid>`: contra todoman 4.7.0 real, `todo`
+identifica las tareas por un entero secuencial inestable (la posición en su
+listado), y `todo --porcelain list` ni siquiera expone el UID. El contrato
+(§2) exige un `uid` estable y único como argumento de las acciones, así que
+la escritura de VTODO no puede pasar por todoman: este binario edita el
+.ics del vdir directamente (para eso existe un vdir) y vdirsyncer lo empuja
+a iCloud en el siguiente sync. Los eventos sí siguen creándose con
+`khal new`, que escribe correctamente en el vdir.
+
+Reutiliza el parser RFC5545 mínimo de icloud-glass-sync (cargado
+dinámicamente desde el fichero hermano, sin modificarlo) para no duplicar
+esa lógica: unfold_ics, parse_ics_line, parse_ics_datetime,
+detect_local_timezone, iso(), resolve_vdir().
+
+Contrato de salida: 0 = hecho. != 0 = una sola línea en stderr, en español,
+sin trazas. Nunca debe escapar una excepción sin capturar.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# --------------------------------------------------------------------------
+# Carga dinámica de icloud-glass-sync (fichero hermano, sin extensión .py)
+# para reutilizar su parser RFC5545 y sus utilidades de rutas/tz, sin
+# tocarlo ni duplicar esa lógica.
+# --------------------------------------------------------------------------
+
+def _load_sync_module():
+    here = Path(__file__).resolve().parent
+    path = here / "icloud-glass-sync"
+    loader = SourceFileLoader("icloud_glass_sync", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise ImportError(f"no se pudo cargar {path}")
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+try:
+    _sync = _load_sync_module()
+except Exception as exc:  # pragma: no cover - solo si el paquete está roto
+    sys.stderr.write(f"icloud-glass-write: no se pudo cargar icloud-glass-sync: {exc}\n")
+    sys.exit(1)
+
+
+class WriteError(Exception):
+    """Error controlado: se convierte en una sola línea en stderr."""
+
+
+# --------------------------------------------------------------------------
+# Folding y escapado RFC5545
+# --------------------------------------------------------------------------
+
+def escape_text(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\\n")
+        .replace("\n", "\\n")
+    )
+
+
+def fold_line(line: str, limit: int = 75) -> str:
+    """Pliega una línea lógica a líneas físicas de máximo `limit` octetos
+    (UTF-8), con continuación indicada por un espacio inicial, sin partir
+    nunca un carácter multibyte por la mitad."""
+    if len(line.encode("utf-8")) <= limit:
+        return line
+    parts: list[str] = []
+    current = ""
+    current_bytes = 0
+    first = True
+    for ch in line:
+        ch_bytes = len(ch.encode("utf-8"))
+        cap = limit if first else limit - 1
+        if current and current_bytes + ch_bytes > cap:
+            parts.append(current)
+            current = ch
+            current_bytes = ch_bytes
+            first = False
+        else:
+            current += ch
+            current_bytes += ch_bytes
+    if current:
+        parts.append(current)
+    return "\r\n ".join(parts)
+
+
+def now_ical_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+# --------------------------------------------------------------------------
+# Rutas
+# --------------------------------------------------------------------------
+
+def vdir_root() -> Path:
+    return _sync.resolve_vdir(None)
+
+
+def reminders_dir() -> Path:
+    return vdir_root() / "reminders"
+
+
+def calendars_dir() -> Path:
+    return vdir_root() / "calendars"
+
+
+def safe_filename_from_uid(uid: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "-", uid)
+    return f"{stem}.ics"
+
+
+# --------------------------------------------------------------------------
+# Escritura atómica de texto (equivalente a atomic_write_json de sync, pero
+# para el contenido .ics en crudo).
+# --------------------------------------------------------------------------
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+# --------------------------------------------------------------------------
+# todo-done
+# --------------------------------------------------------------------------
+
+PROP_NAME_RE = re.compile(r"^([A-Za-z0-9-]+)(;.*)?:")
+
+
+def _prop_name(line: str) -> str | None:
+    m = PROP_NAME_RE.match(line)
+    return m.group(1).upper() if m else None
+
+
+def find_todo_file(uid: str) -> Path:
+    root = reminders_dir()
+    if not root.is_dir():
+        raise WriteError(f"No existe el directorio de recordatorios ({root}).")
+    needle = f"UID:{uid}"
+    for list_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        for ics_path in sorted(list_dir.glob("*.ics")):
+            try:
+                text = ics_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if needle not in text:
+                continue
+            # Confirmación exacta (evita falsos positivos si el UID de uno
+            # es substring del de otro).
+            for logical in _sync.unfold_ics(text):
+                parsed = _sync.parse_ics_line(logical)
+                if parsed and parsed[0] == "UID" and parsed[2] == uid:
+                    return ics_path
+    raise WriteError("No existe ninguna tarea con ese UID.")
+
+
+def todo_done(uid: str, undo: bool) -> str:
+    path = find_todo_file(uid)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = _sync.unfold_ics(text)
+
+    try:
+        vtodo_start = lines.index("BEGIN:VTODO")
+        vtodo_end = lines.index("END:VTODO", vtodo_start)
+    except ValueError:
+        raise WriteError("El fichero del recordatorio está corrupto (falta VTODO).")
+
+    block = lines[vtodo_start:vtodo_end + 1]
+
+    status_value = None
+    has_completed_prop = False
+    for logical in block:
+        name = _prop_name(logical)
+        if name == "STATUS":
+            parsed = _sync.parse_ics_line(logical)
+            status_value = parsed[2].strip().upper() if parsed else None
+        elif name == "COMPLETED":
+            has_completed_prop = True
+
+    currently_completed = status_value == "COMPLETED" or has_completed_prop
+
+    # Idempotencia: no tocar el fichero si ya está en el estado pedido.
+    if undo and not currently_completed:
+        return uid
+    if not undo and currently_completed:
+        return uid
+
+    def replace_or_append(block_lines: list[str], name: str, new_line: str) -> list[str]:
+        out = []
+        replaced = False
+        for logical in block_lines:
+            if _prop_name(logical) == name:
+                if not replaced:
+                    out.append(new_line)
+                    replaced = True
+                # si hubiera duplicados (no debería), se eliminan
+                continue
+            out.append(logical)
+        if not replaced:
+            # insertar justo antes de END:VTODO (último elemento)
+            out = out[:-1] + [new_line] + [out[-1]]
+        return out
+
+    def remove_prop(block_lines: list[str], name: str) -> list[str]:
+        return [logical for logical in block_lines if _prop_name(logical) != name]
+
+    now = now_ical_utc()
+
+    if not undo:
+        block = replace_or_append(block, "STATUS", "STATUS:COMPLETED")
+        block = replace_or_append(block, "PERCENT-COMPLETE", "PERCENT-COMPLETE:100")
+        block = replace_or_append(block, "COMPLETED", f"COMPLETED:{now}")
+    else:
+        block = replace_or_append(block, "STATUS", "STATUS:NEEDS-ACTION")
+        block = remove_prop(block, "COMPLETED")
+        block = remove_prop(block, "PERCENT-COMPLETE")
+
+    # SEQUENCE++ (o 1 si no existía) y LAST-MODIFIED
+    seq_value = 0
+    has_seq = False
+    for logical in block:
+        if _prop_name(logical) == "SEQUENCE":
+            parsed = _sync.parse_ics_line(logical)
+            has_seq = True
+            try:
+                seq_value = int((parsed[2] if parsed else "0").strip() or "0")
+            except ValueError:
+                seq_value = 0
+            break
+    new_seq = seq_value + 1
+    if has_seq:
+        block = replace_or_append(block, "SEQUENCE", f"SEQUENCE:{new_seq}")
+    else:
+        block = replace_or_append(block, "SEQUENCE", f"SEQUENCE:{new_seq}")
+    block = replace_or_append(block, "LAST-MODIFIED", f"LAST-MODIFIED:{now}")
+
+    new_lines = lines[:vtodo_start] + block + lines[vtodo_end + 1:]
+    folded = [fold_line(l) for l in new_lines]
+    new_text = "\r\n".join(folded) + "\r\n"
+
+    atomic_write_text(path, new_text)
+    return uid
+
+
+# --------------------------------------------------------------------------
+# todo-new
+# --------------------------------------------------------------------------
+
+def parse_iso_datetime(value: str, what: str) -> datetime:
+    try:
+        v = value
+        if v.endswith("Z"):
+            v = v[:-1] + "+00:00"
+        dt_ = datetime.fromisoformat(v)
+    except ValueError:
+        raise WriteError(f"El valor de {what} («{value}») no es una fecha ISO 8601 válida.")
+    return dt_
+
+
+def todo_new(list_name: str, summary: str, due_iso: str | None, all_day: bool) -> str:
+    list_dir = reminders_dir() / list_name
+    if not list_dir.is_dir():
+        raise WriteError(f"La lista «{list_name}» no existe.")
+
+    uid = f"{uuid.uuid4()}@icloud-glass.local"
+    now = now_ical_utc()
+
+    due_lines: list[str] = []
+    if due_iso:
+        dt_ = parse_iso_datetime(due_iso, "--due")
+        if all_day:
+            due_lines.append(f"DUE;VALUE=DATE:{dt_.strftime('%Y%m%d')}")
+        else:
+            if dt_.tzinfo is None:
+                dt_utc = dt_.replace(tzinfo=timezone.utc)
+            else:
+                dt_utc = dt_.astimezone(timezone.utc)
+            due_lines.append(f"DUE:{dt_utc.strftime('%Y%m%dT%H%M%SZ')}")
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//icloud-glass//icloud-glass-write//EN",
+        "BEGIN:VTODO",
+        f"UID:{uid}",
+        f"CREATED:{now}",
+        f"DTSTAMP:{now}",
+        f"LAST-MODIFIED:{now}",
+        "SEQUENCE:0",
+        f"SUMMARY:{escape_text(summary)}",
+        *due_lines,
+        "PRIORITY:0",
+        "PERCENT-COMPLETE:0",
+        "STATUS:NEEDS-ACTION",
+        "END:VTODO",
+        "END:VCALENDAR",
+    ]
+    folded = [fold_line(l) for l in lines]
+    text = "\r\n".join(folded) + "\r\n"
+
+    path = list_dir / safe_filename_from_uid(uid)
+    atomic_write_text(path, text)
+    return uid
+
+
+# --------------------------------------------------------------------------
+# event-new (delega en `khal new`)
+# --------------------------------------------------------------------------
+
+def run_khal_new(calendar: str, title: str, start_iso: str, end_iso: str | None,
+                  all_day: bool) -> dict:
+    tz = _sync.detect_local_timezone()
+    cal_root = calendars_dir()
+    if not cal_root.is_dir():
+        raise WriteError(f"No existe el directorio de calendarios ({cal_root}).")
+
+    with tempfile.TemporaryDirectory(prefix="icloud-glass-write-khal-") as td:
+        cfg = _sync.write_khal_config(Path(td), cal_root / "*", tz.key if hasattr(tz, "key") else "UTC")
+        # write_khal_config no incluye [default] print_new; lo añadimos para
+        # poder leer el uid/fecha del evento recién creado por stdout.
+        with open(cfg, "a", encoding="utf-8") as f:
+            f.write("\n[default]\nprint_new = event\n")
+
+        start_dt = parse_iso_datetime(start_iso, "--start")
+        start_local = start_dt.astimezone(tz)
+        args = ["khal", "--config", str(cfg), "new", "-a", calendar,
+                "--json", "uid", "--json", "start-date", "--json", "start-time",
+                "--json", "all-day"]
+        if all_day:
+            args.append("--")
+            args.append(start_local.strftime("%Y-%m-%d"))
+            if end_iso:
+                end_dt = parse_iso_datetime(end_iso, "--end").astimezone(tz)
+                end_date = end_dt.strftime("%Y-%m-%d")
+                if end_date != start_local.strftime("%Y-%m-%d"):
+                    args.append(end_date)
+            args.append(title)
+        else:
+            args.append("--")
+            args.append(start_local.strftime("%Y-%m-%d %H:%M"))
+            if end_iso:
+                end_dt = parse_iso_datetime(end_iso, "--end").astimezone(tz)
+                args.append(end_dt.strftime("%Y-%m-%d %H:%M"))
+            args.append(title)
+
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        except FileNotFoundError:
+            raise WriteError("No se encontró el binario 'khal'. Instálalo e inténtalo de nuevo.")
+        except subprocess.TimeoutExpired:
+            raise WriteError("'khal new' no respondió a tiempo.")
+
+        if proc.returncode != 0:
+            raise WriteError(_translate_khal_error(proc.stderr or proc.stdout, calendar))
+
+        import json as _json
+        try:
+            rows = _json.loads(proc.stdout.strip())
+            row = rows[0] if isinstance(rows, list) else rows
+        except (ValueError, IndexError, TypeError):
+            raise WriteError("'khal new' no devolvió una respuesta reconocible.")
+        return row
+
+
+def _translate_khal_error(raw: str, calendar: str) -> str:
+    text = raw or ""
+    low = text.lower()
+    if "unknown calendar" in low:
+        return f"El calendario «{calendar}» no existe."
+    if "read-only" in low:
+        return f"El calendario «{calendar}» es de solo lectura."
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    last = lines[-1] if lines else "sin más detalle"
+    # Quita el prefijo "Error: " que añade click, para no duplicarlo.
+    last = re.sub(r"^Error:\s*", "", last)
+    return f"No se pudo crear el evento: {last}"
+
+
+def event_new(calendar: str, title: str, start_iso: str, end_iso: str | None,
+              all_day: bool) -> str:
+    row = run_khal_new(calendar, title, start_iso, end_iso, all_day)
+    uid = row.get("uid")
+    if not uid:
+        raise WriteError("'khal new' no devolvió un uid.")
+    tz = _sync.detect_local_timezone()
+    is_all_day = str(row.get("all-day")) == "True"
+    if is_all_day:
+        start_date_s = row.get("start-date") or ""
+        key = f"{uid}|{start_date_s}"
+    else:
+        start_date_s = row.get("start-date") or ""
+        start_time_s = row.get("start-time") or "00:00"
+        start_local = _sync.parse_khal_local(start_date_s, start_time_s, tz)
+        key = f"{uid}|{_sync.iso(start_local)}"
+    return key
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="icloud-glass-write")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_done = sub.add_parser("todo-done")
+    p_done.add_argument("uid")
+    p_done.add_argument("--undo", action="store_true")
+
+    p_tnew = sub.add_parser("todo-new")
+    p_tnew.add_argument("--list", dest="list_name", required=True)
+    p_tnew.add_argument("--summary", required=True)
+    p_tnew.add_argument("--due", default=None)
+    p_tnew.add_argument("--all-day", action="store_true")
+
+    p_enew = sub.add_parser("event-new")
+    p_enew.add_argument("--calendar", required=True)
+    p_enew.add_argument("--title", required=True)
+    p_enew.add_argument("--start", required=True)
+    p_enew.add_argument("--end", default=None)
+    p_enew.add_argument("--all-day", action="store_true")
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    try:
+        if args.command == "todo-done":
+            uid = todo_done(args.uid, args.undo)
+            print(uid)
+        elif args.command == "todo-new":
+            if not args.summary.strip():
+                raise WriteError("El resumen del recordatorio no puede estar vacío.")
+            uid = todo_new(args.list_name, args.summary, args.due, args.all_day)
+            print(uid)
+        elif args.command == "event-new":
+            if not args.title.strip():
+                raise WriteError("El título del evento no puede estar vacío.")
+            key = event_new(args.calendar, args.title, args.start, args.end, args.all_day)
+            print(key)
+        else:  # pragma: no cover - argparse ya lo impide
+            raise WriteError("Comando desconocido.")
+        return 0
+    except WriteError as exc:
+        sys.stderr.write(str(exc).strip() + "\n")
+        return 1
+    except Exception as exc:  # nunca dejar escapar un traceback
+        sys.stderr.write(f"icloud-glass-write: fallo inesperado ({exc}).\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

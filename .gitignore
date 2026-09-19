@@ -1,0 +1,26 @@
+# icloud-glass — dotfiles (paquetes GNU Stow)
+#
+# Lo que NO vive en este repo (y por tanto no hace falta ignorar aquí porque
+# nunca se crea dentro del árbol del repo): los datos sincronizados del vdir
+# (~/.local/share/icloud-glass/vdir/), la caché JSON que lee el QML
+# (~/.cache/icloud-glass/), el Apple ID (~/.config/icloud-glass/account) y la
+# app-specific password (Secret Service / llavero del sistema). Ver
+# docs/CONTRACTS.md, sección 0 ("Rutas canónicas"). Nada de eso son secretos
+# de este repo: son estado del usuario fuera del árbol stow.
+#
+# Nota: ~/.config/vdirsyncer/config, una vez generado por
+# icloud-glass-setup a partir de la plantilla del repo, deja de ser un
+# symlink de stow (icloud-glass-setup lo sobrescribe con un archivo real
+# para poder sustituir @APPLE_ID@). Ese archivo real vive fuera de este
+# árbol de trabajo (en $HOME, ya desenlazado), así que tampoco hace falta
+# ignorarlo aquí.
+
+*.pyc
+__pycache__/
+*.pyo
+
+# Basura habitual de editores/backups
+*~
+*.swp
+*.bak
+.DS_Store

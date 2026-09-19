@@ -1,0 +1,8 @@
+\.git.*
+^/README\.md$
+^/install\.sh$
+^/docs$
+^/tests$
+^/\.stow-local-ignore$
+^/\.gitignore$
+^legacy$
