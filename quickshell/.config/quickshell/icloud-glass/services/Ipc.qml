@@ -47,9 +47,12 @@ Singleton {
             root.panelClosed();
         }
 
+        // Solo emite la señal: `shell.qml` es quien llama a Actions.sync().
+        // Llamar a `Actions` desde aquí obligaría a que este singleton importe el
+        // qmldir de su propio directorio, lo que crea una dependencia circular
+        // entre singletons hermanos. Emitir y delegar mantiene Ipc sin dependencias.
         function refresh() {
             root.refreshRequested();
-            Actions.sync();
         }
     }
 }
