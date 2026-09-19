@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""icloud-glass-setup — asistente interactivo de primera configuración:
+guarda el Apple ID y la app-specific password, genera vdirsyncer/config
+desde la plantilla del repo y lanza el primer discover + sync + refresh.
+"""
+from __future__ import annotations
+
+import getpass
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REQUIRED_TOOLS = {
+    "secret-tool": "libsecret",
+    "vdirsyncer": "vdirsyncer",
+    "khal": "khal",
+    "todo": "todoman",
+}
+
+TEMPLATE_MARKER = "@APPLE_ID@"
+
+
+def xdg_config_home() -> Path:
+    v = os.environ.get("XDG_CONFIG_HOME")
+    return Path(v) if v else Path.home() / ".config"
+
+
+def account_path() -> Path:
+    return xdg_config_home() / "icloud-glass" / "account"
+
+
+def template_path() -> Path:
+    """La plantilla vive en el paquete stow de vdirsyncer del repo. Si el
+    paquete ya está enlazado (stow), ~/.config/vdirsyncer/config ES la
+    plantilla (aún con @APPLE_ID@) la primera vez que se ejecuta este
+    script; a partir de ahí, la sobrescribimos con el config real."""
+    return xdg_config_home() / "vdirsyncer" / "config"
+
+
+def check_tools() -> bool:
+    missing = []
+    for tool, pkg in REQUIRED_TOOLS.items():
+        if shutil.which(tool) is None:
+            missing.append((tool, pkg))
+    if missing:
+        print("Faltan herramientas necesarias:")
+        for tool, pkg in missing:
+            print(f"  - {tool}  ->  instala el paquete de Arch: sudo pacman -S {pkg}")
+        print()
+        return False
+    return True
+
+
+def prompt(msg: str) -> str:
+    try:
+        return input(msg).strip()
+    except EOFError:
+        return ""
+
+
+def read_existing_account() -> str | None:
+    p = account_path()
+    if p.exists():
+        try:
+            return p.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
+    return None
+
+
+def save_account(apple_id: str) -> None:
+    p = account_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(apple_id + "\n", encoding="utf-8")
+    os.chmod(p, 0o600)
+
+
+def has_secret(apple_id: str) -> bool:
+    proc = subprocess.run(
+        ["secret-tool", "lookup", "service", "icloud-glass", "account", apple_id],
+        capture_output=True, text=True,
+    )
+    return proc.returncode == 0 and bool(proc.stdout.strip())
+
+
+def save_password(apple_id: str) -> bool:
+    password = getpass.getpass(
+        "App-specific password de iCloud (no se mostrará ni se guardará en disco): "
+    )
+    if not password:
+        print("Contraseña vacía; se cancela.", file=sys.stderr)
+        return False
+    proc = subprocess.run(
+        ["secret-tool", "store", "--label=iCloud app password (icloud-glass)",
+         "service", "icloud-glass", "account", apple_id],
+        input=password, text=True,
+    )
+    # 'password' solo vive en memoria de este proceso y en el stdin de
+    # secret-tool; nunca se pasa por argv ni se escribe a disco.
+    del password
+    return proc.returncode == 0
+
+
+def write_vdirsyncer_config(apple_id: str) -> Path:
+    dest = xdg_config_home() / "vdirsyncer" / "config"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() and TEMPLATE_MARKER in dest.read_text(encoding="utf-8"):
+        template_text = dest.read_text(encoding="utf-8")
+    else:
+        # Repo checkout: usamos la plantilla del propio repo si el destino
+        # ya fue sustituido antes (para poder volver a generarlo sin
+        # depender de encontrar el repo en disco).
+        repo_template = Path(__file__).resolve().parents[3] / "vdirsyncer" / ".config" / "vdirsyncer" / "config"
+        if repo_template.exists():
+            template_text = repo_template.read_text(encoding="utf-8")
+        elif dest.exists():
+            template_text = dest.read_text(encoding="utf-8")
+        else:
+            print(f"No se encontró la plantilla de vdirsyncer ({repo_template}).", file=sys.stderr)
+            sys.exit(1)
+    dest.write_text(template_text.replace(TEMPLATE_MARKER, apple_id), encoding="utf-8")
+    os.chmod(dest, 0o600)
+    return dest
+
+
+def run_step(cmd: list[str], description: str) -> bool:
+    print(f"-> {description}: {' '.join(cmd)}")
+    proc = subprocess.run(cmd)
+    ok = proc.returncode == 0
+    if not ok:
+        print(f"   (falló con código {proc.returncode})", file=sys.stderr)
+    return ok
+
+
+def summarize_discovery() -> None:
+    """Ejecuta `vdirsyncer discover` (ya se llamó antes) y muestra un
+    resumen legible de qué colecciones aparecieron, separando calendarios de
+    recordatorios. Es importante: no hay garantía de que iCloud exponga por
+    CalDAV TODAS las listas de Recordatorios que existen en el iPhone/Mac."""
+    vdir = Path.home() / ".local" / "share" / "icloud-glass" / "vdir"
+    print()
+    print("Resumen de lo descubierto en iCloud:")
+    for kind, label in (("calendars", "Calendarios"), ("reminders", "Listas de recordatorios")):
+        d = vdir / kind
+        names = sorted(p.name for p in d.iterdir() if p.is_dir()) if d.is_dir() else []
+        print(f"  {label} ({len(names)}):")
+        if names:
+            for n in names:
+                print(f"    - {n}")
+        else:
+            print("    (ninguna encontrada)")
+    print()
+    print("Si esperabas ver más listas de Recordatorios y no aparecen, es un")
+    print("límite conocido: iCloud no siempre expone todas las listas por")
+    print("CalDAV (algunas, como listas compartidas o inteligentes, pueden no")
+    print("aparecer). Esto no se puede verificar sin una cuenta real.")
+    print()
+
+
+def main() -> int:
+    print("icloud-glass-setup — configuración de iCloud Calendar/Reminders")
+    print()
+
+    if not check_tools():
+        return 1
+
+    existing = read_existing_account()
+    if existing:
+        print(f"Ya hay un Apple ID configurado: {existing}")
+        if has_secret(existing):
+            print("Ya hay una contraseña guardada para esa cuenta.")
+        overwrite = prompt("¿Sobrescribir la configuración existente? [s/N] ").lower()
+        if overwrite not in ("s", "si", "sí", "y", "yes"):
+            print("Cancelado. No se ha cambiado nada.")
+            return 0
+
+    apple_id = prompt("Apple ID (email): ")
+    if not apple_id or "@" not in apple_id:
+        print("Apple ID inválido.", file=sys.stderr)
+        return 1
+
+    save_account(apple_id)
+    print(f"Apple ID guardado en {account_path()}")
+
+    if not save_password(apple_id):
+        print("No se pudo guardar la contraseña en el llavero (Secret Service).", file=sys.stderr)
+        return 1
+    print("Contraseña guardada en el llavero del sistema (Secret Service).")
+
+    cfg = write_vdirsyncer_config(apple_id)
+    print(f"Configuración de vdirsyncer generada en {cfg}")
+
+    if not run_step(["vdirsyncer", "discover"], "Descubriendo colecciones de iCloud"):
+        return 1
+    summarize_discovery()
+
+    if not run_step(["vdirsyncer", "sync"], "Primer sync con iCloud"):
+        print("El primer sync falló; revisa las credenciales o la red y vuelve a "
+              "ejecutar 'vdirsyncer sync' o este asistente.", file=sys.stderr)
+        return 1
+
+    sync_bin = shutil.which("icloud-glass-sync") or str(
+        Path(__file__).resolve().parent / "icloud-glass-sync"
+    )
+    if not run_step([sync_bin, "--no-fetch"], "Generando la caché para el panel"):
+        return 1
+
+    print()
+    print("Listo. El panel ya puede leer la caché en $XDG_CACHE_HOME/icloud-glass "
+          "(o ~/.cache/icloud-glass).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

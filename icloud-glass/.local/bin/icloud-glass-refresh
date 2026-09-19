@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""icloud-glass-refresh — atajo para regenerar la caché JSON sin volver a
+sincronizar con iCloud. Equivale a: icloud-glass-sync --no-fetch "$@".
+"""
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+
+
+def main(argv: list[str]) -> int:
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        print("Uso: icloud-glass-refresh [opciones de icloud-glass-sync]")
+        return 0
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "icloud-glass-sync"),
+        shutil.which("icloud-glass-sync"),
+    ]
+    target = next((c for c in candidates if c and os.access(c, os.X_OK)), None)
+    if target is None:
+        sys.stderr.write(
+            "icloud-glass-refresh: no se encontró 'icloud-glass-sync' "
+            "(ni junto a este script ni en el PATH).\n"
+        )
+        return 1
+
+    os.execv(target, [target, "--no-fetch", *argv])
+    return 1  # inalcanzable: execv reemplaza este proceso
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

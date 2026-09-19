@@ -1,0 +1,25 @@
+# Configuración de khal para icloud-glass.
+#
+# `icloud-glass-sync` NO lee este archivo: genera su propia configuración de
+# khal en un directorio temporal en cada ejecución (para poder respetar
+# ICLOUD_GLASS_VDIR y --vdir en los tests sin tocar este archivo). Este
+# config es para el uso interactivo de `khal` desde la terminal, con la ruta
+# canónica del vdir tal y como la define docs/CONTRACTS.md.
+#
+# local_timezone/default_timezone se dejan sin definir a propósito: cuando
+# faltan, khal detecta la zona horaria del sistema automáticamente (lee
+# /etc/localtime). No hace falta (ni conviene) fijarla aquí.
+
+[calendars]
+[[icloud-glass]]
+path = ~/.local/share/icloud-glass/vdir/calendars/*
+type = discover
+
+[locale]
+# Formato europeo día/mes/año y reloj de 24 horas.
+timeformat = %H:%M
+dateformat = %d/%m/%Y
+longdateformat = %d/%m/%Y
+datetimeformat = %d/%m/%Y %H:%M
+longdatetimeformat = %d/%m/%Y %H:%M
+firstweekday = 0

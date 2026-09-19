@@ -1,0 +1,64 @@
+# Plantilla de configuración de vdirsyncer para icloud-glass.
+#
+# El marcador @APPLE_ID@ NO se sustituye por stow: lo hace
+# `icloud-glass-setup`, que lee este archivo tal cual está en el repo,
+# reemplaza @APPLE_ID@ por el Apple ID guardado en
+# ~/.config/icloud-glass/account y escribe el resultado en
+# ~/.config/vdirsyncer/config (sobrescribiendo el symlink de stow con un
+# archivo real, ya que vdirsyncer no permite variables ni interpolación).
+# Si editas este archivo, vuelve a ejecutar icloud-glass-setup para que el
+# cambio se aplique.
+#
+# General.yml de vdirsyncer >=0.20 exige que los valores literales lleven
+# comillas dobles (son JSON), no solo texto INI plano.
+
+[general]
+status_path = "~/.local/share/icloud-glass/vdirsyncer-status/"
+
+# --- Calendarios (VEVENT) -------------------------------------------------
+
+[pair icloud_calendars]
+a = "icloud_calendars_local"
+b = "icloud_calendars_remote"
+collections = ["from b"]
+# El contrato asume que iCloud es la fuente de verdad: si hay un conflicto
+# (edición simultánea en el panel y en otro dispositivo entre dos syncs),
+# preferimos lo que hay en iCloud para no pisar cambios hechos desde el
+# iPhone/Mac, que es el flujo principal de uso. Los cambios locales sin
+# subir se pierden en ese caso raro; se documenta aquí porque es una
+# decisión de producto, no un valor por defecto de vdirsyncer.
+conflict_resolution = "b wins"
+metadata = ["color", "displayname"]
+
+[storage icloud_calendars_local]
+type = "filesystem"
+path = "~/.local/share/icloud-glass/vdir/calendars/"
+fileext = ".ics"
+
+[storage icloud_calendars_remote]
+type = "caldav"
+url = "https://caldav.icloud.com"
+username = "@APPLE_ID@"
+password.fetch = ["command", "secret-tool", "lookup", "service", "icloud-glass", "account", "@APPLE_ID@"]
+item_types = ["VEVENT"]
+
+# --- Recordatorios (VTODO) ------------------------------------------------
+
+[pair icloud_reminders]
+a = "icloud_reminders_local"
+b = "icloud_reminders_remote"
+collections = ["from b"]
+conflict_resolution = "b wins"
+metadata = ["color", "displayname"]
+
+[storage icloud_reminders_local]
+type = "filesystem"
+path = "~/.local/share/icloud-glass/vdir/reminders/"
+fileext = ".ics"
+
+[storage icloud_reminders_remote]
+type = "caldav"
+url = "https://caldav.icloud.com"
+username = "@APPLE_ID@"
+password.fetch = ["command", "secret-tool", "lookup", "service", "icloud-glass", "account", "@APPLE_ID@"]
+item_types = ["VTODO"]

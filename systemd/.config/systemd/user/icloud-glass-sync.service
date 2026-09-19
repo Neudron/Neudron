@@ -1,0 +1,11 @@
+[Unit]
+Description=Sincroniza iCloud Calendar/Reminders y regenera la caché de icloud-glass
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/icloud-glass-sync --quiet
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

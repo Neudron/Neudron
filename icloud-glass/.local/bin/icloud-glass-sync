@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""icloud-glass-sync — sincroniza iCloud (vdirsyncer) y regenera la caché JSON
+que lee el panel Quickshell (events.json, todos.json, status.json), según el
+contrato congelado en docs/CONTRACTS.md. Solo usa la biblioteca estándar.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:  # pragma: no cover - Python < 3.9 no soportado
+    print("Se requiere Python 3.9+ (módulo zoneinfo).", file=sys.stderr)
+    sys.exit(1)
+
+SCHEMA = 1
+
+# Paleta determinista estilo iOS: mismo nombre de calendario/lista -> mismo
+# color siempre (hash estable del nombre, sin depender de lo que diga khal).
+PALETTE = [
+    "#FF9F0A",  # naranja
+    "#0A84FF",  # azul
+    "#BF5AF2",  # púrpura
+    "#30D158",  # verde
+    "#FF453A",  # rojo
+    "#5E5CE6",  # índigo
+    "#64D2FF",  # cian
+    "#FFD60A",  # amarillo
+]
+
+VDIR_SYNC_TIMEOUT = 180  # segundos
+KHAL_TIMEOUT = 60
+STALE_AFTER_MINUTES = 30
+
+ICS_LINE_RE = re.compile(r"^([A-Za-z0-9-]+)((?:;[^:]*)?):(.*)$")
+
+
+# --------------------------------------------------------------------------
+# Utilidades de rutas (respetan XDG_* y los overrides de test)
+# --------------------------------------------------------------------------
+
+def xdg_data_home() -> Path:
+    v = os.environ.get("XDG_DATA_HOME")
+    return Path(v) if v else Path.home() / ".local" / "share"
+
+
+def xdg_cache_home() -> Path:
+    v = os.environ.get("XDG_CACHE_HOME")
+    return Path(v) if v else Path.home() / ".cache"
+
+
+def xdg_config_home() -> Path:
+    v = os.environ.get("XDG_CONFIG_HOME")
+    return Path(v) if v else Path.home() / ".config"
+
+
+def resolve_vdir(cli_value: str | None) -> Path:
+    if os.environ.get("ICLOUD_GLASS_VDIR"):
+        return Path(os.environ["ICLOUD_GLASS_VDIR"])
+    if cli_value:
+        return Path(cli_value)
+    return xdg_data_home() / "icloud-glass" / "vdir"
+
+
+def resolve_cache_dir(cli_value: str | None) -> Path:
+    if os.environ.get("ICLOUD_GLASS_CACHE_DIR"):
+        return Path(os.environ["ICLOUD_GLASS_CACHE_DIR"])
+    if cli_value:
+        return Path(cli_value)
+    return xdg_cache_home() / "icloud-glass"
+
+
+# --------------------------------------------------------------------------
+# Zona horaria local
+# --------------------------------------------------------------------------
+
+def detect_local_timezone() -> ZoneInfo:
+    """Detecta la zona horaria del sistema. Orden: $TZ, /etc/timezone,
+    enlace de /etc/localtime, y si nada funciona, UTC."""
+    candidates = []
+    if os.environ.get("TZ"):
+        candidates.append(os.environ["TZ"])
+    try:
+        txt = Path("/etc/timezone").read_text().strip()
+        if txt:
+            candidates.append(txt)
+    except OSError:
+        pass
+    try:
+        link = os.readlink("/etc/localtime")
+        marker = "zoneinfo/"
+        if marker in link:
+            candidates.append(link.split(marker, 1)[1])
+    except OSError:
+        pass
+    candidates.append("UTC")
+    for name in candidates:
+        try:
+            return ZoneInfo(name)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            continue
+    return ZoneInfo("UTC")
+
+
+def iso(dt_: datetime) -> str:
+    """Formatea un datetime tz-aware como ISO 8601 con offset, sin microsegundos."""
+    return dt_.replace(microsecond=0).isoformat()
+
+
+def color_for(name: str) -> str:
+    h = hashlib.sha256(name.encode("utf-8")).digest()
+    return PALETTE[h[0] % len(PALETTE)]
+
+
+# --------------------------------------------------------------------------
+# Ejecución de subprocesos y clasificación de errores
+# --------------------------------------------------------------------------
+
+class ToolError(Exception):
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def run(cmd: list[str], timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except FileNotFoundError:
+        raise ToolError("tool", f"No se encontró el binario '{cmd[0]}'. Instálalo e inténtalo de nuevo.")
+    except subprocess.TimeoutExpired:
+        raise ToolError("network", f"'{cmd[0]}' no respondió a tiempo (timeout de {timeout}s).")
+
+
+def classify_vdirsyncer_failure(proc: subprocess.CompletedProcess) -> tuple[str, str]:
+    text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    low = text.lower()
+    if re.search(r"\b401\b|\b403\b|unauthorized|forbidden|invalid credentials|bad username or password", low):
+        return "auth", "iCloud rechazó las credenciales. Genera una nueva app-specific password."
+    if re.search(r"getaddrinfo|name or service not known|temporary failure in name resolution|"
+                 r"connection refused|network is unreachable|connection reset|could not connect|"
+                 r"max retries exceeded|newconnectionerror", low):
+        return "network", "Sin conexión con iCloud. Comprueba tu red e inténtalo de nuevo."
+    if re.search(r"\b5\d\d\b|internal server error|bad gateway|service unavailable|gateway timeout", low):
+        return "server", "El servidor de iCloud no respondió correctamente. Vuelve a intentarlo más tarde."
+    if re.search(r"no configuration|invalid configuration|not found in config|collection.*not found|"
+                 r"pair.*not found|run.*discover|storage instance failed", low):
+        return "config", "La configuración de vdirsyncer es inválida o falta ejecutar 'vdirsyncer discover'."
+    return "unknown", "El sync con iCloud falló por un motivo desconocido. Revisa los logs de vdirsyncer."
+
+
+def run_vdirsyncer_sync(quiet: bool) -> tuple[bool, str | None, str | None]:
+    """Devuelve (ok, errorKind, error_message)."""
+    try:
+        proc = run(["vdirsyncer", "sync"], timeout=VDIR_SYNC_TIMEOUT)
+    except ToolError as exc:
+        return False, exc.kind, exc.message
+    if proc.returncode == 0:
+        return True, None, None
+    kind, msg = classify_vdirsyncer_failure(proc)
+    if not quiet:
+        sys.stderr.write(proc.stderr or proc.stdout or "")
+    return False, kind, msg
+
+
+# --------------------------------------------------------------------------
+# Descubrimiento del vdir
+# --------------------------------------------------------------------------
+
+def discover_collections(root: Path) -> list[str]:
+    if not root.is_dir():
+        return []
+    names = []
+    for entry in sorted(root.iterdir()):
+        if entry.is_dir() and not entry.name.startswith("."):
+            names.append(entry.name)
+    return names
+
+
+# --------------------------------------------------------------------------
+# Eventos: usamos khal (expande recurrencias/timezones) vía su CLI --json.
+# --------------------------------------------------------------------------
+
+def write_khal_config(tmpdir: Path, calendars_glob: Path, local_tz_name: str) -> Path:
+    cfg = tmpdir / "khal.conf"
+    cfg.write_text(
+        "[calendars]\n"
+        "[[icloud-glass]]\n"
+        f"path = {calendars_glob}\n"
+        "type = discover\n"
+        "\n"
+        "[locale]\n"
+        f"local_timezone = {local_tz_name}\n"
+        f"default_timezone = {local_tz_name}\n"
+        "timeformat = %H:%M\n"
+        "dateformat = %Y-%m-%d\n"
+        "longdateformat = %Y-%m-%d\n"
+        "datetimeformat = %Y-%m-%d %H:%M\n"
+        "longdatetimeformat = %Y-%m-%d %H:%M\n"
+    )
+    return cfg
+
+
+def parse_khal_local(date_str: str, time_str: str, tz: ZoneInfo) -> datetime:
+    if time_str:
+        naive = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+    else:
+        naive = datetime.strptime(date_str, "%Y-%m-%d")
+    return naive.replace(tzinfo=tz)
+
+
+def load_events(vdir_calendars: Path, start_date: date, range_days: int,
+                 tz: ZoneInfo, quiet: bool) -> tuple[list[dict], list[dict], str | None, str | None]:
+    """Devuelve (events, calendars, errorKind, error_message)."""
+    calendar_names = discover_collections(vdir_calendars)
+    calendars = [{"name": n, "color": color_for(n)} for n in calendar_names]
+
+    if not calendar_names:
+        return [], calendars, None, None
+
+    with tempfile.TemporaryDirectory(prefix="icloud-glass-khal-") as td:
+        cfg = write_khal_config(Path(td), vdir_calendars / "*", tz.key if hasattr(tz, "key") else "UTC")
+        end_date = start_date + timedelta(days=range_days)
+        cmd = [
+            "khal", "--config", str(cfg), "list", "--json", "all",
+            start_date.isoformat(), f"{range_days}d",
+        ]
+        try:
+            proc = run(cmd, timeout=KHAL_TIMEOUT)
+        except ToolError as exc:
+            return [], calendars, exc.kind, exc.message
+        if proc.returncode != 0:
+            if not quiet:
+                sys.stderr.write(proc.stderr or "")
+            return [], calendars, "config", "khal no pudo leer los calendarios descubiertos (¿configuración inválida?)."
+
+        raw_rows: list[dict] = []
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw_rows.extend(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    by_key: dict[str, dict] = {}
+    for row in raw_rows:
+        all_day = row.get("all-day") == "True"
+        cal_name = row.get("calendar") or ""
+        color = color_for(cal_name)
+        start_d = row.get("start-date") or ""
+        end_d = row.get("end-date") or start_d
+        if all_day:
+            start_iso = None
+            end_iso = None
+            duration_minutes = None
+            start_date_s = start_d
+            end_date_s = end_d
+        else:
+            start_dt = parse_khal_local(start_d, row.get("start-time") or "00:00", tz)
+            end_dt = parse_khal_local(end_d, row.get("end-time") or "00:00", tz)
+            start_iso = iso(start_dt)
+            end_iso = iso(end_dt)
+            # OJO: start_dt y end_dt comparten el mismo objeto ZoneInfo, así
+            # que "end_dt - start_dt" usaría el atajo de CPython para
+            # tzinfo idéntico (resta ingenua, ignorando el cambio de
+            # offset) y daría un resultado erróneo si el evento cruza un
+            # cambio de hora (DST). Hay que pasar por timestamp()/UTC.
+            duration_minutes = round((end_dt.timestamp() - start_dt.timestamp()) / 60)
+            start_date_s = start_d
+            end_date_s = end_d
+
+        uid = row.get("uid") or ""
+        key = f"{uid}|{start_iso if start_iso else start_date_s}"
+
+        status_raw = (row.get("status") or "").strip()
+        status = status_raw if status_raw in ("CONFIRMED", "TENTATIVE", "CANCELLED") else (status_raw or None)
+        cancelled = status == "CANCELLED"
+
+        categories_raw = row.get("categories") or ""
+        categories = [c.strip() for c in categories_raw.split(",") if c.strip()]
+
+        location = (row.get("location") or "").strip() or None
+        description = (row.get("description") or "").strip() or None
+        url = (row.get("url") or "").strip() or None
+
+        event = {
+            "uid": uid,
+            "key": key,
+            "title": row.get("title") or "",
+            "calendar": cal_name,
+            "color": color,
+            "allDay": all_day,
+            "start": start_iso,
+            "end": end_iso,
+            "startDate": start_date_s,
+            "endDate": end_date_s,
+            "durationMinutes": duration_minutes,
+            "location": location,
+            "description": description,
+            "recurring": bool((row.get("repeat-pattern") or "").strip()),
+            "status": status,
+            "cancelled": cancelled,
+            "url": url,
+            "categories": categories,
+        }
+        # Deduplicación: un evento multi-día aparece una vez por cada día que
+        # khal --json recorre; la 'key' (uid + inicio) es idéntica en todas
+        # esas filas, así que el dict ya las colapsa en una sola entrada.
+        by_key[key] = event
+
+    events = list(by_key.values())
+    events.sort(key=lambda e: (e["startDate"], 0 if e["allDay"] else 1, e["start"] or "", e["title"] or ""))
+    return events, calendars, None, None
+
+
+# --------------------------------------------------------------------------
+# Recordatorios (VTODO): parseo directo del .ics.
+#
+# NOTA DE DISEÑO: `todo --porcelain list --status ANY` se ejecuta como
+# comprobación de salud de todoman (confirma que el binario y la
+# configuración funcionan, y sirve para clasificar errores de 'tool' o
+# 'config'), pero NO se usa como fuente de datos: su salida porcelain no
+# incluye ni 'uid' ni 'created' ni si el 'due' es solo fecha, y el contrato
+# exige un 'uid' estable y único. Para no inventar un identificador que no
+# está en el contrato, leemos los VTODO directamente (mismo vdir que usa
+# todoman). Ver el informe final para más detalle de esta decisión.
+# --------------------------------------------------------------------------
+
+def unfold_ics(text: str) -> list[str]:
+    lines = text.replace("\r\n", "\n").split("\n")
+    out: list[str] = []
+    for line in lines:
+        if line.startswith((" ", "\t")) and out:
+            out[-1] += line[1:]
+        elif line:
+            out.append(line)
+    return out
+
+
+def parse_ics_line(line: str) -> tuple[str, dict, str] | None:
+    m = ICS_LINE_RE.match(line)
+    if not m:
+        return None
+    name = m.group(1).upper()
+    param_str = m.group(2)
+    value = m.group(3)
+    params: dict[str, str] = {}
+    if param_str:
+        for part in param_str.split(";"):
+            if not part:
+                continue
+            if "=" in part:
+                k, v = part.split("=", 1)
+                params[k.upper()] = v.strip('"')
+    value = value.replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+    return name, params, value
+
+
+def parse_ics_datetime(value: str, params: dict, tz: ZoneInfo) -> tuple[datetime, bool]:
+    """Devuelve (datetime local con offset, all_day)."""
+    value = value.strip()
+    if params.get("VALUE") == "DATE" or (len(value) == 8 and "T" not in value):
+        d = datetime.strptime(value, "%Y%m%d").date()
+        return datetime.combine(d, datetime.min.time(), tzinfo=tz), True
+    is_utc = value.endswith("Z")
+    core = value[:-1] if is_utc else value
+    naive = datetime.strptime(core, "%Y%m%dT%H%M%S")
+    if is_utc:
+        aware = naive.replace(tzinfo=timezone.utc).astimezone(tz)
+    elif params.get("TZID"):
+        try:
+            src_tz = ZoneInfo(params["TZID"])
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            src_tz = tz
+        aware = naive.replace(tzinfo=src_tz).astimezone(tz)
+    else:
+        aware = naive.replace(tzinfo=tz)
+    return aware, False
+
+
+def parse_vtodo_file(path: Path, tz: ZoneInfo) -> dict | None:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    lines = unfold_ics(text)
+    in_vtodo = False
+    props: dict[str, tuple[dict, str]] = {}
+    for line in lines:
+        if line == "BEGIN:VTODO":
+            in_vtodo = True
+            props = {}
+            continue
+        if line == "END:VTODO":
+            break
+        if not in_vtodo:
+            continue
+        parsed = parse_ics_line(line)
+        if not parsed:
+            continue
+        name, params, value = parsed
+        props[name] = (params, value)
+
+    if "UID" not in props or "SUMMARY" not in props:
+        return None
+
+    uid = props["UID"][1]
+    summary = props["SUMMARY"][1]
+    status_raw = props.get("STATUS", ({}, ""))[1].upper()
+    completed = status_raw == "COMPLETED" or "COMPLETED" in props
+
+    completed_at = None
+    if "COMPLETED" in props:
+        p, v = props["COMPLETED"]
+        dt_, _ = parse_ics_datetime(v, p, tz)
+        completed_at = iso(dt_)
+
+    due = None
+    due_date = None
+    due_all_day = False
+    if "DUE" in props:
+        p, v = props["DUE"]
+        dt_, all_day = parse_ics_datetime(v, p, tz)
+        due_all_day = all_day
+        due_date = dt_.date().isoformat()
+        # A diferencia de los eventos, en los recordatorios 'due' NUNCA es
+        # null cuando hay DUE (dueAllDay indica si esa hora es significativa
+        # o solo medianoche sintética) — así lo definen los fixtures del
+        # contrato (todo-allday-1: due != null con dueAllDay=true).
+        due = iso(dt_)
+
+    created = None
+    if "CREATED" in props:
+        p, v = props["CREATED"]
+        dt_, _ = parse_ics_datetime(v, p, tz)
+        created = iso(dt_)
+
+    try:
+        priority = int(props.get("PRIORITY", ({}, "0"))[1] or "0")
+    except ValueError:
+        priority = 0
+    priority = max(0, min(9, priority))
+
+    try:
+        percent = int(props.get("PERCENT-COMPLETE", ({}, "0"))[1] or "0")
+    except ValueError:
+        percent = 0
+    percent = max(0, min(100, percent))
+    if completed:
+        percent = 100
+
+    description = props.get("DESCRIPTION", ({}, ""))[1].strip() or None
+    categories_raw = props.get("CATEGORIES", ({}, ""))[1]
+    categories = [c.strip() for c in categories_raw.split(",") if c.strip()]
+
+    return {
+        "uid": uid,
+        "summary": summary,
+        "completed": completed,
+        "completedAt": completed_at,
+        "due": due,
+        "dueDate": due_date,
+        "dueAllDay": due_all_day,
+        "priority": priority,
+        "percent": percent,
+        "description": description,
+        "categories": categories,
+        "created": created,
+    }
+
+
+def priority_label(priority: int) -> str:
+    if priority == 0:
+        return "none"
+    if priority <= 4:
+        return "high"
+    if priority == 5:
+        return "medium"
+    return "low"
+
+
+def load_todos(vdir_reminders: Path, tz: ZoneInfo, generated: datetime,
+                quiet: bool) -> tuple[list[dict], list[dict], str | None, str | None]:
+    list_names = discover_collections(vdir_reminders)
+    todos: list[dict] = []
+    pending_count = {n: 0 for n in list_names}
+    completed_count = {n: 0 for n in list_names}
+
+    for list_name in list_names:
+        list_color = color_for(list_name)
+        list_dir = vdir_reminders / list_name
+        for ics_path in sorted(list_dir.glob("*.ics")):
+            parsed = parse_vtodo_file(ics_path, tz)
+            if parsed is None:
+                continue
+            overdue = False
+            if parsed["due"] is not None and not parsed["completed"]:
+                overdue = parsed["due"] < iso(generated)
+
+            todo = {
+                "uid": parsed["uid"],
+                "summary": parsed["summary"],
+                "list": list_name,
+                "color": list_color,
+                "completed": parsed["completed"],
+                "completedAt": parsed["completedAt"],
+                "due": parsed["due"],
+                "dueDate": parsed["dueDate"],
+                "dueAllDay": parsed["dueAllDay"],
+                "overdue": overdue,
+                "priority": parsed["priority"],
+                "priorityLabel": priority_label(parsed["priority"]),
+                "percent": parsed["percent"],
+                "description": parsed["description"],
+                "categories": parsed["categories"],
+                "created": parsed["created"],
+            }
+            todos.append(todo)
+            if parsed["completed"]:
+                completed_count[list_name] += 1
+            else:
+                pending_count[list_name] += 1
+
+    lists = [
+        {
+            "name": n,
+            "color": color_for(n),
+            "pending": pending_count.get(n, 0),
+            "completed": completed_count.get(n, 0),
+        }
+        for n in list_names
+    ]
+
+    def sort_key(t: dict):
+        due_key = t["due"] or "9999"
+        prio = 10 if t["priority"] == 0 else t["priority"]
+        return (
+            1 if t["completed"] else 0,
+            0 if t["overdue"] else 1,
+            due_key,
+            prio,
+            t["summary"] or "",
+        )
+
+    todos.sort(key=sort_key)
+
+    # Verificación de salud de todoman (no se usa como fuente de datos; ver
+    # la nota de diseño más arriba). Un fallo aquí no invalida los datos ya
+    # parseados directamente del vdir, pero sí se reporta como error de
+    # 'tool'/'config' si ni siquiera arranca.
+    error_kind = None
+    error_message = None
+    if list_names:
+        with tempfile.TemporaryDirectory(prefix="icloud-glass-todoman-") as td:
+            cfg_path = Path(td) / "todoman.py"
+            cfg_path.write_text(
+                f'path = "{vdir_reminders}/*"\n'
+                'date_format = "%Y-%m-%d"\n'
+                'time_format = "%H:%M"\n'
+            )
+            try:
+                proc = run(["todo", "--config", str(cfg_path), "--porcelain", "list", "--status", "ANY"],
+                           timeout=KHAL_TIMEOUT)
+                if proc.returncode != 0:
+                    error_kind = "config"
+                    error_message = "todoman no pudo leer los recordatorios descubiertos (¿configuración inválida?)."
+                    if not quiet:
+                        sys.stderr.write(proc.stderr or "")
+            except ToolError as exc:
+                error_kind, error_message = exc.kind, exc.message
+
+    return todos, lists, error_kind, error_message
+
+
+# --------------------------------------------------------------------------
+# Escritura atómica
+# --------------------------------------------------------------------------
+
+def atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.chmod(tmp_name, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def load_json_if_valid(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="icloud-glass-sync",
+        description="Sincroniza iCloud (vdirsyncer) y regenera la caché JSON "
+                    "(events.json, todos.json, status.json) que lee el panel.",
+    )
+    p.add_argument("--no-fetch", action="store_true",
+                    help="No ejecuta 'vdirsyncer sync'; solo regenera la caché a partir del vdir local.")
+    p.add_argument("--range-days", type=int, default=60,
+                    help="Días hacia adelante a incluir en events.json (por defecto: 60).")
+    p.add_argument("--cache-dir", default=None, help="Directorio de caché (por defecto: $XDG_CACHE_HOME/icloud-glass).")
+    p.add_argument("--vdir", default=None, help="Directorio del vdir (por defecto: $XDG_DATA_HOME/icloud-glass/vdir).")
+    p.add_argument("--quiet", action="store_true", help="No escribe nada en stderr salvo errores fatales.")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+    started = time.monotonic()
+
+    cache_dir = resolve_cache_dir(args.cache_dir)
+    vdir = resolve_vdir(args.vdir)
+    events_path = cache_dir / "events.json"
+    todos_path = cache_dir / "todos.json"
+    status_path = cache_dir / "status.json"
+
+    now = datetime.now().astimezone()
+    prev_status = load_json_if_valid(status_path) or {}
+    prev_counts = prev_status.get("counts") or {"events": 0, "todos": 0, "calendars": 0, "lists": 0}
+    prev_last_sync_ok = prev_status.get("lastSyncOk")
+
+    # 1. Marcar 'syncing' sin tocar los datos existentes.
+    try:
+        atomic_write_json(status_path, {
+            "schema": SCHEMA,
+            "state": "syncing",
+            "lastSync": iso(now),
+            "lastSyncOk": prev_last_sync_ok,
+            "durationMs": 0,
+            "error": None,
+            "errorKind": None,
+            "counts": prev_counts,
+        })
+    except OSError as exc:
+        if not args.quiet:
+            sys.stderr.write(f"icloud-glass-sync: no se pudo escribir status.json: {exc}\n")
+        # seguimos igualmente: preferimos intentar regenerar la caché
+
+    fetch_ok = True
+    fetch_error_kind = None
+    fetch_error_message = None
+
+    if not args.no_fetch:
+        fetch_ok, fetch_error_kind, fetch_error_message = run_vdirsyncer_sync(args.quiet)
+    else:
+        # sin fetch, no es un error: simplemente no hay novedades de iCloud
+        fetch_ok = True
+
+    tz = detect_local_timezone()
+    generated = datetime.now(tz)
+
+    regen_error_kind = None
+    regen_error_message = None
+    events: list[dict] = []
+    calendars: list[dict] = []
+    todos: list[dict] = []
+    lists: list[dict] = []
+    regen_ok = True
+
+    try:
+        if not vdir.is_dir():
+            # El vdir todavía no existe: lo normal es que no se haya
+            # ejecutado icloud-glass-setup / vdirsyncer discover todavía.
+            # No es un fallo de red ni un traceback: es un problema de
+            # configuración que el usuario puede resolver.
+            regen_error_kind = "config"
+            regen_error_message = ("No existe el directorio del vdir "
+                                    f"({vdir}). Ejecuta icloud-glass-setup primero.")
+        vdir_calendars = vdir / "calendars"
+        vdir_reminders = vdir / "reminders"
+        events, calendars, ev_kind, ev_msg = load_events(
+            vdir_calendars, generated.date(), args.range_days, tz, args.quiet,
+        )
+        if ev_kind:
+            regen_error_kind, regen_error_message = ev_kind, ev_msg
+
+        todos, lists, td_kind, td_msg = load_todos(vdir_reminders, tz, generated, args.quiet)
+        if td_kind and regen_error_kind is None:
+            # Un fallo de todoman (health-check) no impide usar los datos ya
+            # parseados directamente del vdir; solo lo anotamos si además no
+            # había ya un error de eventos más grave.
+            regen_error_kind, regen_error_message = td_kind, td_msg
+    except Exception as exc:  # nunca dejar un traceback sin capturar
+        regen_ok = False
+        regen_error_kind = "unknown"
+        regen_error_message = f"Fallo inesperado al regenerar la caché: {exc}"
+        if not args.quiet:
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+
+    have_previous_cache = events_path.exists() and todos_path.exists()
+
+    if regen_ok:
+        range_end = (generated.date() + timedelta(days=args.range_days)).isoformat()
+        events_doc = {
+            "schema": SCHEMA,
+            "generated": iso(generated),
+            "range": {"start": generated.date().isoformat(), "end": range_end},
+            "calendars": calendars,
+            "events": events,
+        }
+        todos_doc = {
+            "schema": SCHEMA,
+            "generated": iso(generated),
+            "lists": lists,
+            "todos": todos,
+        }
+        try:
+            atomic_write_json(events_path, events_doc)
+            atomic_write_json(todos_path, todos_doc)
+            have_previous_cache = True
+        except OSError as exc:
+            regen_ok = False
+            regen_error_kind = "unknown"
+            regen_error_message = f"No se pudo escribir la caché: {exc}"
+
+    duration_ms = int((time.monotonic() - started) * 1000)
+
+    overall_ok = fetch_ok and regen_ok and not fetch_error_kind and not regen_error_kind
+    error_kind = fetch_error_kind or regen_error_kind
+    error_message = fetch_error_message or regen_error_message
+
+    if overall_ok:
+        state = "ok"
+        last_sync_ok = iso(generated)
+        error_kind = None
+        error_message = None
+    elif have_previous_cache:
+        state = "stale"
+        # lastSyncOk solo avanza cuando el sync fue realmente correcto de
+        # principio a fin (overall_ok); un error de fetch o de regen -aunque
+        # hayamos podido regenerar una caché "stale" con datos viejos del
+        # vdir- no cuenta como último éxito.
+        last_sync_ok = prev_last_sync_ok
+        if error_kind is None:
+            error_kind = "unknown"
+            error_message = error_message or "El último sync tuvo problemas; se muestran los últimos datos disponibles."
+    else:
+        state = "error"
+        last_sync_ok = prev_last_sync_ok
+        if error_kind is None:
+            error_kind = "unknown"
+            error_message = error_message or "No hay caché utilizable todavía."
+
+    counts = {
+        "events": len(events) if regen_ok else prev_counts.get("events", 0),
+        "todos": len(todos) if regen_ok else prev_counts.get("todos", 0),
+        "calendars": len(calendars) if regen_ok else prev_counts.get("calendars", 0),
+        "lists": len(lists) if regen_ok else prev_counts.get("lists", 0),
+    }
+
+    try:
+        atomic_write_json(status_path, {
+            "schema": SCHEMA,
+            "state": state,
+            "lastSync": iso(now),
+            "lastSyncOk": last_sync_ok,
+            "durationMs": duration_ms,
+            "error": error_message,
+            "errorKind": error_kind,
+            "counts": counts,
+        })
+    except OSError as exc:
+        if not args.quiet:
+            sys.stderr.write(f"icloud-glass-sync: no se pudo escribir status.json final: {exc}\n")
+        return 1
+
+    if not args.quiet:
+        print(f"icloud-glass-sync: estado={state} eventos={counts['events']} "
+              f"tareas={counts['todos']} ({duration_ms} ms)")
+
+    return 0 if state != "error" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
