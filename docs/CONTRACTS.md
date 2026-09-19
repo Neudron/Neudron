@@ -237,3 +237,34 @@ Variantes de estado para probar la UI:
 `tests/fixtures/events-empty.json`, `todos-empty.json`.
 
 Los QML se prueban con `ICLOUD_GLASS_CACHE_DIR=$PWD/tests/fixtures qs -p quickshell/.config/quickshell/icloud-glass/shell.qml`.
+
+---
+
+## 9. CLI de escritura — `icloud-glass-write` (añadido en Ola C, tras integrar A1+A2)
+
+**Por qué existe.** A2 asumió que el QML podía llamar a `todo done <uid>`. A1 comprobó contra todoman 4.7.0
+real que `todo` identifica las tareas por un **entero secuencial inestable**, no por UID, y que
+`--porcelain` ni siquiera expone el UID. Usar ese entero rompería la unicidad y la estabilidad que exige
+la sección 2. Por eso la escritura de VTODO no pasa por todoman: un binario propio edita el `.ics` del vdir
+(que es exactamente para lo que sirve un vdir) y `vdirsyncer` lo empuja a iCloud en el siguiente sync.
+
+**Los eventos sí siguen pasando por `khal new`**, que escribe correctamente en el vdir.
+
+```
+icloud-glass-write todo-done  <uid> [--undo]
+icloud-glass-write todo-new   --list <nombre> --summary <texto> [--due <iso8601>] [--all-day]
+icloud-glass-write event-new  --calendar <nombre> --title <texto> --start <iso> [--end <iso>] [--all-day]
+```
+
+Contrato de comportamiento:
+- Salida 0 = hecho. Salida != 0 = **una sola línea en stderr, en español, diciendo la causa**
+  (`No existe ninguna tarea con ese UID.`, `La lista «Compra» no existe.`, …). Nada de tracebacks.
+- `todo-new` y `event-new` imprimen en stdout el `uid` (todo) o la `key` (evento) creados, y nada más.
+- Toda escritura actualiza `LAST-MODIFIED`, incrementa `SEQUENCE` y escribe con write+`os.replace`.
+- `todo-done` marca `STATUS:COMPLETED`, `PERCENT-COMPLETE:100` y `COMPLETED:<ahora UTC>`; `--undo`
+  revierte a `STATUS:NEEDS-ACTION` y borra `COMPLETED`/`PERCENT-COMPLETE`.
+- Es idempotente: completar algo ya completado sale 0 sin tocar el archivo.
+- Respeta `ICLOUD_GLASS_VDIR`.
+
+`Actions.qml` llama a `icloud-glass-write …` y después a `icloud-glass-refresh`, y lanza
+`icloud-glass-sync` en segundo plano. La firma pública de `Actions` (sección 6) **no cambia**.
