@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "state": "error",
+  "lastSync": "2026-09-19T12:30:00+02:00",
+  "lastSyncOk": null,
+  "durationMs": 700,
+  "error": "iCloud rechazó las credenciales. Genera una nueva app-specific password.",
+  "errorKind": "auth",
+  "counts": { "events": 0, "todos": 0, "calendars": 0, "lists": 0 }
+}

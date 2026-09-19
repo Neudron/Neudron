@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "state": "syncing",
+  "lastSync": "2026-09-19T12:30:00+02:00",
+  "lastSyncOk": "2026-09-19T12:00:00+02:00",
+  "durationMs": 0,
+  "error": null,
+  "errorKind": null,
+  "counts": { "events": 10, "todos": 8, "calendars": 3, "lists": 3 }
+}

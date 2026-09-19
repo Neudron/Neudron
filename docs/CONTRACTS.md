@@ -1,0 +1,239 @@
+# CONTRACTS.md — contratos congelados de icloud-glass
+
+> **Congelado en la Ola 0.** Ningún agente puede añadir, renombrar ni reinterpretar campos de este
+> documento. Si algo falta, el agente **para y lo reporta al orquestador**; no improvisa.
+
+## 0. Rutas canónicas
+
+| Qué | Ruta |
+|---|---|
+| vdir (datos sincronizados) | `~/.local/share/icloud-glass/vdir/` |
+| Caché JSON (lo que lee el QML) | `~/.cache/icloud-glass/` |
+| Config de usuario del shell | `~/.config/quickshell/icloud-glass/shell.json` |
+| Apple ID (no secreto) | `~/.config/icloud-glass/account` |
+| App-specific password | Secret Service: `service=icloud-glass account=<appleid>` |
+
+Variables de entorno respetadas: `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`.
+Override para tests: `ICLOUD_GLASS_CACHE_DIR`, `ICLOUD_GLASS_VDIR`.
+
+---
+
+## 1. `events.json`
+
+Escrito por `icloud-glass-sync` / `icloud-glass-refresh`. Siempre **write + rename** (atómico).
+
+```jsonc
+{
+  "schema": 1,
+  "generated": "2026-09-19T12:00:00+02:00",   // ISO 8601 con offset, hora local
+  "range": { "start": "2026-09-19", "end": "2026-11-18" },
+  "calendars": [                                // todos los calendarios conocidos, aunque estén vacíos
+    { "name": "Personal", "color": "#FF9F0A" }
+  ],
+  "events": [
+    {
+      "uid": "6F3A...@icloud.com",  // string, NO único entre ocurrencias de un recurrente
+      "key": "6F3A...@icloud.com|2026-09-19T14:30:00+02:00", // string ÚNICO por ocurrencia. Clave de lista.
+      "title": "Reunión de equipo",
+      "calendar": "Personal",
+      "color": "#FF9F0A",           // hex #RRGGBB, siempre presente (fallback del Config)
+      "allDay": false,
+      "start": "2026-09-19T14:30:00+02:00",  // null SI Y SOLO SI allDay
+      "end":   "2026-09-19T15:30:00+02:00",  // null SI Y SOLO SI allDay
+      "startDate": "2026-09-19",    // siempre presente; fecha local de inicio
+      "endDate":   "2026-09-19",    // siempre presente; fecha local del último día INCLUSIVE
+      "durationMinutes": 60,        // null si allDay
+      "location": null,
+      "description": null,
+      "recurring": false,
+      "status": "CONFIRMED",        // CONFIRMED | TENTATIVE | CANCELLED | null
+      "cancelled": false,
+      "url": null,
+      "categories": []
+    }
+  ]
+}
+```
+
+Reglas duras:
+- `events` viene **ordenado** por `startDate`, luego all-day primero, luego `start`, luego `title`.
+- Un evento multi-día genera **una sola entrada** con `startDate != endDate`. El QML lo expande.
+- Un recurrente genera **una entrada por ocurrencia** dentro de `range`, cada una con su propia `key`.
+- Los campos nunca se omiten: si no hay valor, es `null` (o `[]` en listas).
+
+## 2. `todos.json`
+
+```jsonc
+{
+  "schema": 1,
+  "generated": "2026-09-19T12:00:00+02:00",
+  "lists": [
+    { "name": "Recordatorios", "color": "#0A84FF", "pending": 3, "completed": 12 }
+  ],
+  "todos": [
+    {
+      "uid": "A1B2...",           // string ÚNICO. Clave de lista y argumento de las acciones.
+      "summary": "Entregar trabajo",
+      "list": "Recordatorios",
+      "color": "#0A84FF",
+      "completed": false,
+      "completedAt": null,        // ISO 8601 o null
+      "due": "2026-09-20T09:00:00+02:00",  // null si no tiene hora; null si no tiene due
+      "dueDate": "2026-09-20",    // null si no tiene due
+      "dueAllDay": false,         // true = solo fecha, sin hora
+      "overdue": false,           // calculado por el backend contra `generated`
+      "priority": 0,              // 0 = ninguna, 1-4 = alta, 5 = media, 6-9 = baja (RFC 5545)
+      "priorityLabel": "none",    // none | low | medium | high  (derivado, para no repetir lógica)
+      "percent": 0,               // 0-100
+      "description": null,
+      "categories": [],
+      "created": "2026-09-01T10:00:00+02:00"
+    }
+  ]
+}
+```
+
+Reglas duras:
+- `todos` ordenado por: pendientes antes que completados → vencidos primero → `due` ascendente
+  (los sin `due` al final) → `priority` ascendente tratando 0 como 10 → `summary`.
+- `lists` incluye listas vacías (para poder mostrar el estado "Todo hecho" por lista).
+
+## 3. `status.json`
+
+```jsonc
+{
+  "schema": 1,
+  "state": "ok",             // ok | syncing | stale | error
+  "lastSync": "2026-09-19T12:00:00+02:00",   // último intento
+  "lastSyncOk": "2026-09-19T12:00:00+02:00", // último ÉXITO; null si nunca
+  "durationMs": 1840,
+  "error": null,             // mensaje humano, una frase, en español
+  "errorKind": null,         // network | auth | server | config | tool | unknown
+  "counts": { "events": 42, "todos": 15, "calendars": 3, "lists": 2 }
+}
+```
+
+`state`:
+- `ok` — último sync bien y hace <30 min.
+- `stale` — hay caché válida pero el último sync falló o fue hace >30 min. **El QML sigue mostrando datos.**
+- `error` — no hay caché utilizable.
+- `syncing` — escrito al empezar; el QML muestra el indicador sin borrar los datos.
+
+## 4. `shell.json` (config de usuario) — tokens
+
+```jsonc
+{
+  "schema": 1,
+  "theme": "auto",                 // auto | light | dark
+  "accentFromWallpaper": true,
+  "monitor": null,                 // null = monitor enfocado; o el nombre ("DP-1")
+  "position": "center",            // center | top-right | top-left | bottom-right | bottom-left
+  "hiddenCalendars": [],
+  "hiddenLists": [],
+  "defaultList": null,             // lista destino de QuickAdd; null = la primera
+  "syncIntervalMinutes": 15,
+  "upcomingCount": 5,
+  "reducedMotion": "auto",         // auto | on | off
+  "colors": {
+    "dark":  { "surface": "#0E0E11", "surfaceAlpha": 0.38, "surfaceRaised": "#1A1A1F",
+               "onSurface": "#F5F5F7", "onSurfaceMuted": "#A1A1AA", "accent": "#0A84FF",
+               "stroke": "#FFFFFF", "strokeAlpha": 0.14, "danger": "#FF453A", "success": "#30D158" },
+    "light": { "surface": "#FFFFFF", "surfaceAlpha": 0.55, "surfaceRaised": "#F2F2F7",
+               "onSurface": "#1C1C1E", "onSurfaceMuted": "#6E6E73", "accent": "#0071E3",
+               "stroke": "#000000", "strokeAlpha": 0.08, "danger": "#D70015", "success": "#248A3D" }
+  },
+  "calendarColors": {},            // { "Personal": "#FF9F0A" } — override manual
+  "font": { "family": "Inter", "scale": 1.0 }
+}
+```
+
+Escala de espaciado fija (no configurable): `4, 8, 12, 16, 24, 32`.
+Radios fijos: chip `12`, tarjeta `20`, panel `28`.
+Escala tipográfica fija: `11, 13, 15, 17, 22, 28`.
+
+---
+
+## 5. API de `GlassSurface.qml`
+
+```qml
+GlassSurface {
+    radius: 20            // real, por defecto 20
+    tint: "#0E0E11"       // color base; por defecto Config.c.surface
+    tintAlpha: 0.38       // real 0..1
+    elevation: 1          // int 0..3 → intensidad de sombra y borde
+    refraction: 1.0       // real 0..1.5; 0 desactiva el shader (reduced motion / fallback)
+    specular: true        // bool; highlight superior
+    interactive: false    // bool; si true, el specular sigue al ratón
+    // default property alias content → los hijos se colocan dentro, con clip al radio
+}
+```
+Debe funcionar sin shader (si `qsb` falla o `refraction === 0`) degradando a color plano + borde.
+
+## 6. API de los singletons
+
+```qml
+// services/Config.qml   (Singleton)
+readonly property var raw          // shell.json ya parseado y fusionado con los defaults
+readonly property var c            // paleta activa ya resuelta (theme auto → light/dark)
+readonly property bool dark
+readonly property bool reducedMotion
+function calendarColor(name) -> string
+function listColor(name) -> string
+signal reloaded()
+
+// services/DataStore.qml   (Singleton)
+readonly property var events              // array, tal cual el contrato (ya filtrado por hiddenCalendars)
+readonly property var todos               // array, idem con hiddenLists
+readonly property var calendars           // array de {name, color}
+readonly property var lists               // array de {name, color, pending, completed}
+readonly property var status              // objeto status.json
+readonly property bool ready              // true cuando hay datos utilizables (aunque sean stale)
+function eventsOn(dateString) -> array    // "YYYY-MM-DD"
+function upcoming(n) -> array             // desde ahora, ignora los ya terminados
+function hasEventsOn(dateString) -> bool
+function colorsOn(dateString) -> array    // colores únicos, para los puntos del mes
+function todosFor(listName) -> array
+
+// services/Actions.qml   (Singleton)
+function completeTodo(uid, completed)     // completed: bool (permite deshacer)
+function newTodo(listName, summary, dueIso /*o null*/)
+function newEvent(calendarName, title, startIso, endIso, allDay)
+function sync()                           // dispara icloud-glass-sync
+signal actionFailed(string what, string message)
+signal actionSucceeded(string what)
+readonly property bool busy
+
+// services/Ipc.qml  → IpcHandler target "panel": toggle() open() close() refresh()
+```
+
+`Actions` es **optimista**: emite el cambio local al instante, y si el `Process` sale != 0 revierte y
+emite `actionFailed`. Nunca bloquea la UI.
+
+---
+
+## 7. Mapa de propiedad de archivos
+
+| Agente | Dueño exclusivo de |
+|---|---|
+| A1 | `icloud-glass/**`, `vdirsyncer/**`, `khal/**`, `todoman/**`, `systemd/**` |
+| A2 | `quickshell/.config/quickshell/icloud-glass/services/**` |
+| A3 | `quickshell/.config/quickshell/icloud-glass/components/**`, `.../shaders/**` |
+| B1 | `.../modules/CalendarWidget.qml`, `.../modules/EventList.qml` |
+| B2 | `.../modules/RemindersWidget.qml`, `.../modules/QuickAdd.qml` |
+| B3 | `install.sh`, `.stow-local-ignore`, `.gitignore`, `hypr/**`, `README.md`, `docs/icloud-glass.md` |
+| Orquestador | `docs/CONTRACTS.md`, `tests/**`, `.../shell.qml`, `.../modules/CombinedPanel.qml` |
+
+Nadie escribe fuera de su columna. `docs/CONTRACTS.md` es de solo lectura para todos menos el orquestador.
+
+## 8. Fixtures
+
+`tests/fixtures/{events,todos,status}.json` — casos duros incluidos: evento recurrente semanal,
+evento de todo el día, evento multi-día que cruza cambio de hora (DST del 25-10-2026),
+evento cancelado, reminder vencido, reminder con prioridad alta, reminder completado,
+lista de reminders vacía.
+
+Variantes de estado para probar la UI:
+`tests/fixtures/status-error-network.json`, `status-error-auth.json`, `status-stale.json`,
+`tests/fixtures/events-empty.json`, `todos-empty.json`.
+
+Los QML se prueban con `ICLOUD_GLASS_CACHE_DIR=$PWD/tests/fixtures qs -p quickshell/.config/quickshell/icloud-glass/shell.qml`.
