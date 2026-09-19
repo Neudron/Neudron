@@ -1,0 +1,11 @@
+# Ignore local a este paquete de stow (hypr/). GNU Stow solo lee
+# .stow-local-ignore dentro del propio directorio del paquete, no el de la
+# raíz del repo (ver "Types And Syntax Of Ignore Lists" en el manual de
+# Stow), así que este archivo es necesario aquí además del de la raíz.
+#
+# `legacy/` NO se enlaza en $HOME: no es un dotfile real, es la config
+# hyprlang deprecada (hypr/legacy/icloud-glass.conf), pensada para
+# `source`arse directamente desde su ruta en el propio repo (ver
+# install.sh y docs/icloud-glass.md). Si se enlazase tal cual, GNU Stow
+# crearía un `~/legacy/` sin sentido en la raíz del HOME.
+^/legacy$

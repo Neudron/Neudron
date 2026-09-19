@@ -323,9 +323,11 @@ check_hyprland_version() {
         info "  (el archivo ya está enlazado en ~/.config/hypr/lua/icloud-glass.lua)."
     else
         info "Hyprland <= 0.54 (hyprlang todavía activo, sin hyprland.lua)."
-        info "  Añade  source = ~/hypr/legacy/icloud-glass.conf  a tu"
-        info "  ~/.config/hypr/hyprland.conf. hyprlang se elimina pronto: actualiza"
-        info "  Hyprland y migra a la config Lua en cuanto puedas."
+        info "  Añade  source = $SCRIPT_DIR/hypr/legacy/icloud-glass.conf  a tu"
+        info "  ~/.config/hypr/hyprland.conf. Nota: hypr/legacy/ NO se enlaza con"
+        info "  stow (a propósito); se referencia directamente desde la ruta del"
+        info "  repo. hyprlang se elimina pronto: actualiza Hyprland y migra a la"
+        info "  config Lua en cuanto puedas."
     fi
 }
 
@@ -382,7 +384,7 @@ EOF
 # --------------------------------------------------------------------------
 
 print_next_steps() {
-    cat <<'EOF'
+    cat <<EOF
 
 ==> Instalación completa. Pasos siguientes:
 
@@ -393,7 +395,7 @@ print_next_steps() {
        - Hyprland >= 0.55: añade a ~/.config/hypr/hyprland.lua
              require("lua.icloud-glass")
        - Hyprland <= 0.54 (legacy): añade a ~/.config/hypr/hyprland.conf
-             source = ~/hypr/legacy/icloud-glass.conf
+             source = $SCRIPT_DIR/hypr/legacy/icloud-glass.conf
 
   3. Recarga Hyprland:
        hyprctl reload
