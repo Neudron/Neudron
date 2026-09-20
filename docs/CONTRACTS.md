@@ -268,3 +268,50 @@ Contrato de comportamiento:
 
 `Actions.qml` llama a `icloud-glass-write …` y después a `icloud-glass-refresh`, y lanza
 `icloud-glass-sync` en segundo plano. La firma pública de `Actions` (sección 6) **no cambia**.
+
+---
+
+## 10. Política de color y contraste (medida, no supuesta — Ola D)
+
+`tests/contrast.py` la comprueba y **falla el build si se incumple**. Sustituye a la tabla informal de
+tokens: lo de aquí es lo que manda.
+
+### El problema que resuelve
+El panel es translúcido sobre un wallpaper arbitrario. Con un alpha fijo el contraste no tiene solución:
+para garantizar 4.5:1 sobre cualquier fondo haría falta `surfaceAlpha` ≥ 0.93, es decir, opaco, lo que
+elimina el efecto Liquid Glass. Medido: con la configuración inicial (0.38 / 0.55), el texto principal
+sobre un wallpaper blanco daba **2.31:1**. Ilegible.
+
+### Las tres reglas
+
+1. **Los tokens de texto cumplen AA sobre su superficie opaca.** Si un token no llega, está mal elegido y
+   ningún alpha lo arregla. Medido: `onSurface` 17.7:1 (oscuro) y 17.0:1 (claro).
+
+2. **Alpha adaptativo con elección automática de tema.** `Config.qml` calcula
+   `alphaEfectivo = max(surfaceAlpha configurado, mínimo exigido por el wallpaper)` y elige el tema que
+   menos alpha necesite para la luminancia media del wallpaper. Con eso el alpha **nunca pasa de 0.48**
+   (peor caso: wallpaper de luminancia 144) y baja a **0.00** en wallpapers muy oscuros o muy claros. El
+   techo aceptado es 0.55; por encima el panel deja de parecer cristal y el test falla.
+
+   | Luminancia del wallpaper | 0 | 64 | 128 | 160 | 192 | 255 |
+   |---|---|---|---|---|---|---|
+   | Tema elegido | oscuro | oscuro | oscuro | claro | claro | claro |
+   | Alpha mínimo | 0.00 | 0.00 | 0.40 | 0.42 | 0.12 | 0.00 |
+
+3. **`accent`, `danger` y `success` son MARCAS, no texto**, y **solo se pintan sobre `surfaceRaised`**.
+   Son puntos de calendario, barras de color, círculos de check e iconos, así que les aplica WCAG 1.4.11
+   (3:1), no 4.5:1 — precisamente porque el contrato ya prohíbe transmitir estado solo con color: la marca
+   siempre va acompañada de texto o icono en `onSurface`.
+   **Sobre el cristal desnudo estos colores caen a 1.0–1.7:1, o sea invisibles.** De ahí la regla.
+
+### Tokens corregidos
+
+| Token | Antes | Ahora | Por qué |
+|---|---|---|---|
+| `dark.surfaceRaised` | `#1A1A1F` | `#22222A` | separación con el cristal era 1.03:1 |
+| `light.surfaceRaised` | `#F2F2F7` | `#E8E8F0` | separación era 1.06:1 |
+| `light.accent` | `#0071E3` | `#0062C4` | no llegaba a 3:1 como marca |
+| `light.success` | `#248A3D` | `#1E7A34` | 3.94:1 sobre superficie opaca |
+| `surfaceRaisedAlpha` | — | `0.92` (ambos temas) | **token nuevo**: las filas son más sólidas que el cristal |
+
+Comprobar siempre con `python3 tests/contrast.py` tras tocar cualquier color.

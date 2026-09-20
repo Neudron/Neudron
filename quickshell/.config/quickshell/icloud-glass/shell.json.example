@@ -14,28 +14,33 @@
     "dark": {
       "surface": "#0E0E11",
       "surfaceAlpha": 0.38,
-      "surfaceRaised": "#1A1A1F",
+      "surfaceRaised": "#22222A",
       "onSurface": "#F5F5F7",
       "onSurfaceMuted": "#A1A1AA",
       "accent": "#0A84FF",
       "stroke": "#FFFFFF",
       "strokeAlpha": 0.14,
       "danger": "#FF453A",
-      "success": "#30D158"
+      "success": "#30D158",
+      "surfaceRaisedAlpha": 0.92
     },
     "light": {
       "surface": "#FFFFFF",
       "surfaceAlpha": 0.55,
-      "surfaceRaised": "#F2F2F7",
+      "surfaceRaised": "#E8E8F0",
       "onSurface": "#1C1C1E",
       "onSurfaceMuted": "#6E6E73",
-      "accent": "#0071E3",
+      "accent": "#0062C4",
       "stroke": "#000000",
       "strokeAlpha": 0.08,
       "danger": "#D70015",
-      "success": "#248A3D"
+      "success": "#1E7A34",
+      "surfaceRaisedAlpha": 0.92
     }
   },
   "calendarColors": {},
-  "font": { "family": "Inter", "scale": 1.0 }
+  "font": {
+    "family": "Inter",
+    "scale": 1.0
+  }
 }
