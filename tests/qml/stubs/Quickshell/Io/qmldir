@@ -1,0 +1,10 @@
+module Quickshell.Io
+
+singleton ProcessRegistry 1.0 ProcessRegistry.qml
+singleton FileViewError 1.0 FileViewError.qml
+FileView 1.0 FileView.qml
+DataStreamParser 1.0 DataStreamParser.qml
+StdioCollector 1.0 StdioCollector.qml
+SplitParser 1.0 SplitParser.qml
+Process 1.0 Process.qml
+IpcHandler 1.0 IpcHandler.qml

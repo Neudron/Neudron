@@ -1,0 +1,9 @@
+module Quickshell
+
+singleton Quickshell 1.0 QuickshellGlobal.qml
+Singleton 1.0 Singleton.qml
+ShellRoot 1.0 ShellRoot.qml
+PanelWindow 1.0 PanelWindow.qml
+PanelAnchorsGroup 1.0 PanelAnchorsGroup.qml
+PanelMarginsGroup 1.0 PanelMarginsGroup.qml
+ShellScreen 1.0 ShellScreen.qml

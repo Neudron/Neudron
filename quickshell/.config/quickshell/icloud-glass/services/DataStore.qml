@@ -173,6 +173,29 @@ Singleton {
 
     onEventsChanged: dayCache = {}
 
+    // FALLO REAL encontrado y corregido (D1, tests/qml/tst_datastore.qml /
+    // zzdebug del arnés offscreen): esta función se llama desde
+    // eventsOn()/colorsOn()/hasEventsOn(), que a su vez se llaman desde
+    // bindings de otros componentes (p.ej. CalendarWidget.cells, que llama a
+    // Services.DataStore.colorsOn(iso) 42 veces por rejilla mensual). La
+    // versión anterior memoizaba REASIGNANDO la propiedad `dayCache`
+    // (`dayCache = nc`) dentro de esa misma función de lectura. Como QML
+    // registra automáticamente como dependencia de un binding CUALQUIER
+    // propiedad leída durante su evaluación (aquí, `dayCache.hasOwnProperty`
+    // más arriba), y esa misma evaluación además la REESCRIBE, se producía
+    // un "Binding loop detected for property 'cells'" reproducible con
+    // cualquier fixture, en la primera renderización de un mes (caché
+    // fría) — confirmado de forma aislada con qmltestrunner offscreen,
+    // sin ninguna otra causa concurrente.
+    //
+    // La corrección: mutar el objeto de caché EN EL SITIO (sin volver a
+    // asignar la propiedad `dayCache`), así no se emite dayCacheChanged y no
+    // hay ciclo. Nada fuera de esta función lee `dayCache` como propiedad
+    // reactiva (solo a través de eventsOn/colorsOn/hasEventsOn), así que el
+    // comportamiento observable no cambia: sigue memoizando exactamente
+    // igual, invalidado por onEventsChanged y por el Timer de medianoche de
+    // más abajo (esos sí son reasignaciones legítimas, hechas FUERA de
+    // cualquier evaluación de binding).
     function dayCacheEntry(dateString) {
         if (dayCache.hasOwnProperty(dateString)) return dayCache[dateString];
         var matched = [];
@@ -188,10 +211,7 @@ Singleton {
             if (c && !seen[c]) { seen[c] = true; colors.push(c); }
         }
         var entry = { events: matched, colors: colors };
-        var nc = {};
-        for (var k in dayCache) nc[k] = dayCache[k];
-        nc[dateString] = entry;
-        dayCache = nc;
+        dayCache[dateString] = entry;
         return entry;
     }
 

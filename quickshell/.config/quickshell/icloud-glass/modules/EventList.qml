@@ -141,8 +141,24 @@ Item {
                 width: listView.width
                 sourceComponent: modelData.kind === "header" ? headerDelegate : eventDelegate
 
-                property var itemData: modelData
-                property int itemIndex: index
+                // FALLO REAL encontrado y corregido (D1, tests/qml/tst_combined_panel.qml):
+                // declarar `property var itemData: modelData` aquí NO llega a
+                // la `required property var itemData` de headerDelegate/
+                // eventDelegate más abajo — son objetos QML DISTINTOS (el
+                // Loader y el ítem que instancia); un Loader no propaga sus
+                // propias propiedades al componente cargado. El resultado
+                // era, en cada fila, el warning de motor "Required property
+                // itemData was not initialized" y la fila renderizándose sin
+                // datos reales (itemData quedaba undefined). Reproducido de
+                // forma aislada con qmltestrunner offscreen. La corrección
+                // sigue el mismo patrón que ya usa RemindersWidget.qml
+                // (propiedad ../modules/RemindersWidget.qml) para su propio
+                // Loader: asignar explícitamente tras la carga.
+                onLoaded: {
+                    if (!item) return;
+                    item.itemData = rowLoader.modelData;
+                    if (item.hasOwnProperty("itemIndex")) item.itemIndex = rowLoader.index;
+                }
             }
         }
     }
@@ -150,8 +166,13 @@ Item {
     Component {
         id: headerDelegate
         Text {
-            required property var itemData
-            text: itemData.label
+            // NO `required`: lo rellena Loader.onLoaded de más arriba, DESPUÉS
+            // de que el ítem ya se ha creado — `required` solo se puede
+            // satisfacer en la creación (mismo motivo por el que
+            // RemindersWidget.qml usa `property var itemData` normal, no
+            // required, para su propio patrón Loader+onLoaded).
+            property var itemData
+            text: itemData ? itemData.label : ""
             font.pixelSize: root.fontS
             font.bold: true
             font.letterSpacing: 0.3
@@ -165,11 +186,12 @@ Item {
         id: eventDelegate
         Item {
             id: eventRoot
-            required property var itemData
-            required property int itemIndex
+            // NO `required`: mismo motivo que en headerDelegate más arriba.
+            property var itemData
+            property int itemIndex: 0
 
-            readonly property var ev: itemData.event
-            readonly property bool cancelled: ev.cancelled === true
+            readonly property var ev: itemData ? itemData.event : null
+            readonly property bool cancelled: !!(ev && ev.cancelled === true)
 
             implicitHeight: eventRow.implicitHeight + root.spS
             opacity: 0

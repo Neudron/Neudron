@@ -75,7 +75,22 @@ Item {
         root.errorText = "";
         root.confirmingDiscard = false;
         root.open = true;
-        Qt.callLater(function () { summaryInput.forceActiveFocus(); });
+        // FALLO REAL encontrado y corregido (D1, tests/qml/tst_quickadd.qml):
+        // `summaryInput` es un id declarado DENTRO de `Component { id:
+        // cardComponent ... }` (ver más abajo), que es su propio ámbito de
+        // ids separado del documento — NUNCA es visible como identificador
+        // suelto aquí, ni siquiera diferido con Qt.callLater (no es una
+        // carrera de tiempos: literalmente no existe ese nombre en este
+        // ámbito). Cada apertura del popover lanzaba un
+        // "ReferenceError: summaryInput is not defined" silencioso y el
+        // campo de texto nunca recibía el foco automático. Confirmado de
+        // forma aislada con qmltestrunner offscreen. Corrección: exponer el
+        // campo con un alias en la raíz de cardComponent y llegar a él a
+        // través del Loader (que si tiene id propio, ver `cardLoader` más
+        // abajo).
+        Qt.callLater(function () {
+            if (cardLoader.item) cardLoader.item.summaryInput.forceActiveFocus();
+        });
     }
 
     // Cierre "educado": si hay texto sin enviar pide confirmación en vez de
@@ -214,6 +229,7 @@ Item {
 
         // --- tarjeta desplegable ---
         Loader {
+            id: cardLoader
             width: parent.width
             active: root.open
             sourceComponent: cardComponent
@@ -225,6 +241,10 @@ Item {
 
         Rectangle {
             id: card
+            // Expuesto para que openPopover() (fuera de este Component, otro
+            // ámbito de ids) pueda llegar al campo de texto vía
+            // cardLoader.item.summaryInput — ver la nota en openPopover().
+            property alias summaryInput: summaryInput
             width: parent ? parent.width : 0
             implicitHeight: cardColumn.implicitHeight + root.spLg * 2
             height: implicitHeight
